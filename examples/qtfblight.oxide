@@ -1,0 +1,11 @@
+{
+  "displayName": "Example QTFB Client",
+  "description": "A QTFB application hosted by qtfblight",
+  "bin": "/home/root/qtfblight",
+  "type": "foreground",
+  "flags": ["nopreload"],
+  "workingDirectory": "/home/root/xovi/exthome/appload/example-client",
+  "environment": {
+    "_QTFBLIGHT_COMMAND": "'/home/root/xovi/exthome/appload/example-client/client' '--example-option'"
+  }
+}
