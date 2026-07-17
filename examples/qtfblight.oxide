@@ -1,7 +1,7 @@
 {
   "displayName": "Example QTFB Client",
   "description": "A QTFB application hosted by qtfblight",
-  "bin": "/home/root/qtfblight",
+  "bin": "/home/root/.vellum/bin/qtfblight",
   "type": "foreground",
   "flags": ["nopreload"],
   "workingDirectory": "/home/root/xovi/exthome/appload/example-client",

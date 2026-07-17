@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-const DEFAULT_QTFBLIGHT: &str = "/home/root/qtfblight";
+const DEFAULT_QTFBLIGHT: &str = "/home/root/.vellum/bin/qtfblight";
 const DEFAULT_OXIDE_RUNNER: &str = "/home/root/.vellum/share/oxide/libexec/runner";
 
 #[derive(Debug, Deserialize)]

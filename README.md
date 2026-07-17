@@ -14,8 +14,9 @@ Use the matching reMarkable SDK:
 
 ## Run
 
+Assuming you installed qtfblight using Vellum, run:
 ```sh
-./qtfblight /path/to/qtfb-client --client-argument
+qtfblight /path/to/qtfb-client --client-argument
 ```
 
 ## Oxide
@@ -29,7 +30,7 @@ appload-to-oxide /home/root/xovi/exthome/appload/example-client \
   --output /home/root/.local/share/applications/example-client.oxide
 ```
 
-`"qtfb": true` uses `/home/root/qtfblight`. Shim manifests and KOReader are
+`"qtfb": true` uses `/home/root/.vellum/bin/qtfblight`. Shim manifests and KOReader are
 skipped. `icon` is included only when `icon.png` exists.
 
 ## Chroot clients
