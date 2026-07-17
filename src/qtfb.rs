@@ -47,6 +47,29 @@ pub const INPUT_PEN_UPDATE: i32 = 0x22;
 pub const INPUT_BTN_PRESS: i32 = 0x30;
 pub const INPUT_BTN_RELEASE: i32 = 0x31;
 
+// TODO(https://github.com/Eeems-Org/oxide/issues/382): Forward these when
+// Oxide/libblight exposes a virtual-keyboard input source. They are
+// intentionally no-ops for now.
+pub const INPUT_VKB_PRESS: i32 = 0x40;
+pub const INPUT_VKB_RELEASE: i32 = 0x41;
+
+pub const INPUT_BTN_X_LEFT: i32 = 0;
+pub const INPUT_BTN_X_HOME: i32 = 1;
+pub const INPUT_BTN_X_RIGHT: i32 = 2;
+
+pub const INPUT_VKB_SHIFTMOD: i32 = 0x100000;
+pub const INPUT_VKB_CTRLMOD: i32 = 0x200000;
+pub const INPUT_VKB_ALTMOD: i32 = 0x400000;
+pub const INPUT_VKB_DEL: i32 = 0x7f;
+pub const INPUT_VKB_PGUP: i32 = 0x80;
+pub const INPUT_VKB_PGDOWN: i32 = 0x81;
+pub const INPUT_VKB_DOWN: i32 = 0x82;
+pub const INPUT_VKB_UP: i32 = 0x83;
+pub const INPUT_VKB_LEFT: i32 = 0x84;
+pub const INPUT_VKB_RIGHT: i32 = 0x85;
+pub const INPUT_VKB_HOME: i32 = 0x86;
+pub const INPUT_VKB_END: i32 = 0x87;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct InitMessageContents {

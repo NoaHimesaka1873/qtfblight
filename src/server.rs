@@ -104,6 +104,10 @@ impl ShmSegment {
             return Err(format!("mmap failed: {}", err));
         }
 
+        // AppLoad initializes a new QTFB framebuffer to white.  Keep the
+        // same first-frame state for all supported pixel formats.
+        unsafe { std::ptr::write_bytes(ptr as *mut u8, 0xFF, size) };
+
         Ok(ShmSegment { name, ptr, size })
     }
 
@@ -206,7 +210,9 @@ pub fn generate_random_key() -> i32 {
 fn send_server_message(fd: c_int, msg: &ServerMessage) -> bool {
     let ptr = msg as *const ServerMessage as *const c_void;
     let len = std::mem::size_of::<ServerMessage>();
-    let bytes_sent = unsafe { libc::send(fd, ptr, len, libc::MSG_NOSIGNAL) };
+    // Input forwarding must not stall if a client is not reading its socket.
+    // Match AppLoad by dropping packets when the socket buffer is full.
+    let bytes_sent = unsafe { libc::send(fd, ptr, len, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
     bytes_sent == len as isize
 }
 
@@ -645,6 +651,8 @@ pub fn handle_client(
         let touch_profile = profile.clone();
         let touch_width = width;
         let touch_height = height;
+        let touch_surface_id = surface_id;
+        let touch_blight_fd = blight_fd;
         std::thread::spawn(move || {
             let thread_bus = match touch_lib.connect_bus() {
                 Ok(b) => b,
@@ -685,6 +693,7 @@ pub fn handle_client(
                 dirty: false,
             }; 16];
             let mut current_slot = 0;
+            let mut five_finger_refresh_sent = false;
 
             while touch_running.load(Ordering::Relaxed) {
                 match touch_lib.event_from_buffer(touch_buf, true) {
@@ -708,6 +717,30 @@ pub fn handle_client(
                                 slots[current_slot].dirty = true;
                             }
                         } else if ev.type_ == EV_SYN && ev.code == SYN_REPORT {
+                            let active_touches =
+                                slots.iter().filter(|slot| slot.tracking_id != -1).count();
+                            if active_touches == 5 && !five_finger_refresh_sent {
+                                if let Err(e) = touch_lib.surface_repaint(
+                                    touch_blight_fd,
+                                    touch_surface_id,
+                                    0,
+                                    0,
+                                    touch_profile.width,
+                                    touch_profile.height,
+                                    BlightWaveformMode::Full,
+                                    touch_profile.color_type,
+                                    BlightUpdateMode::FullUpdate,
+                                ) {
+                                    println!(
+                                        "[touch_thread] five-finger full refresh failed: {}",
+                                        e
+                                    );
+                                }
+                                five_finger_refresh_sent = true;
+                            } else if active_touches == 0 {
+                                five_finger_refresh_sent = false;
+                            }
+
                             for i in 0..16 {
                                 if slots[i].dirty {
                                     let id = slots[i].tracking_id;
@@ -1120,8 +1153,8 @@ pub fn handle_client(
                     backend_info.surface_id,
                     0,
                     0,
-                    width,
-                    height,
+                    profile.width,
+                    profile.height,
                     BlightWaveformMode::Full,
                     profile.color_type,
                     BlightUpdateMode::FullUpdate,
