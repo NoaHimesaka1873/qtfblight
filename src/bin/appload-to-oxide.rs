@@ -150,14 +150,12 @@ fn uses_qtfb_shim(manifest: &ExternalManifest) -> bool {
             .environment
             .get("LD_PRELOAD")
             .is_some_and(|preload| {
-                preload
-                    .split(|character| character == ':' || character == ' ')
-                    .any(|entry| {
-                        matches!(
-                            Path::new(entry).file_name().and_then(|name| name.to_str()),
-                            Some("qtfb-shim.so" | "qtfb-shim-32bit.so")
-                        )
-                    })
+                preload.split([':', ' ']).any(|entry| {
+                    matches!(
+                        Path::new(entry).file_name().and_then(|name| name.to_str()),
+                        Some("qtfb-shim.so" | "qtfb-shim-32bit.so")
+                    )
+                })
             })
 }
 

@@ -18,17 +18,20 @@
  */
 
 use crate::blight::{
-    BlightBus, BlightImageFormat, BlightUpdateMode, BlightWaveformMode, LibBlight,
+    BlightBufferSpec, BlightBus, BlightImageFormat, BlightRepaintRequest, BlightUpdateMode,
+    BlightWaveformMode, LibBlight,
 };
 use crate::device::DeviceProfile;
 use crate::qtfb::{
     ClientMessage, FBFMT_RM2FB, FBFMT_RMPP_RGB565, FBFMT_RMPP_RGB888, FBFMT_RMPP_RGBA8888,
     FBFMT_RMPPM_RGB565, FBFMT_RMPPM_RGB888, FBFMT_RMPPM_RGBA8888, INPUT_BTN_PRESS,
-    INPUT_BTN_RELEASE, INPUT_PEN_PRESS, INPUT_PEN_RELEASE, INPUT_PEN_UPDATE, INPUT_TOUCH_PRESS,
-    INPUT_TOUCH_RELEASE, INPUT_TOUCH_UPDATE, InitMessageResponseContents,
-    MESSAGE_CUSTOM_INITIALIZE, MESSAGE_INITIALIZE, MESSAGE_REQUEST_FULL_REFRESH,
-    MESSAGE_SET_REFRESH_MODE, MESSAGE_TERMINATE, MESSAGE_UPDATE, MESSAGE_USERINPUT, ServerMessage,
-    ServerMessageUnion, UPDATE_ALL, UPDATE_PARTIAL, UserInputContents,
+    INPUT_BTN_RELEASE, INPUT_BTN_X_HOME, INPUT_BTN_X_LEFT, INPUT_BTN_X_RIGHT, INPUT_PEN_PRESS,
+    INPUT_PEN_RELEASE, INPUT_PEN_UPDATE, INPUT_TOUCH_PRESS, INPUT_TOUCH_RELEASE,
+    INPUT_TOUCH_UPDATE, InitMessageResponseContents, MESSAGE_CUSTOM_INITIALIZE, MESSAGE_INITIALIZE,
+    MESSAGE_REQUEST_FULL_REFRESH, MESSAGE_SET_REFRESH_MODE, MESSAGE_TERMINATE, MESSAGE_UPDATE,
+    MESSAGE_USERINPUT, REFRESH_MODE_ANIMATE, REFRESH_MODE_CONTENT, REFRESH_MODE_FAST,
+    REFRESH_MODE_UI, REFRESH_MODE_ULTRA_FAST, ServerMessage, ServerMessageUnion, UPDATE_ALL,
+    UPDATE_PARTIAL, UserInputContents,
 };
 
 const EV_SYN: u16 = 0x00;
@@ -50,10 +53,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-unsafe impl Send for LibBlight {}
-unsafe impl Sync for LibBlight {}
-
-pub struct ShmSegment {
+struct ShmSegment {
+    key: i32,
     name: String,
     ptr: *mut c_void,
     size: usize,
@@ -108,11 +109,12 @@ impl ShmSegment {
         // same first-frame state for all supported pixel formats.
         unsafe { std::ptr::write_bytes(ptr as *mut u8, 0xFF, size) };
 
-        Ok(ShmSegment { name, ptr, size })
-    }
-
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr as *mut u8
+        Ok(ShmSegment {
+            key,
+            name,
+            ptr,
+            size,
+        })
     }
 }
 
@@ -127,8 +129,15 @@ impl Drop for ShmSegment {
     }
 }
 
+// The mapping is shared between the QTFB client and the server by design.
+// Ownership is synchronized through `Arc`; this type does not expose safe
+// references to the mapped bytes.
+unsafe impl Send for ShmSegment {}
+unsafe impl Sync for ShmSegment {}
+
 pub struct SeqPacketListener {
     pub fd: c_int,
+    path: CString,
 }
 
 impl SeqPacketListener {
@@ -141,7 +150,8 @@ impl SeqPacketListener {
             ));
         }
 
-        let c_path = CString::new(path).unwrap();
+        let c_path =
+            CString::new(path).map_err(|_| "Socket path contains a NUL byte".to_string())?;
         unsafe { libc::unlink(c_path.as_ptr()) };
 
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -166,11 +176,14 @@ impl SeqPacketListener {
 
         if unsafe { libc::listen(fd, 5) } < 0 {
             let err = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
+            unsafe {
+                libc::close(fd);
+                libc::unlink(c_path.as_ptr());
+            }
             return Err(format!("listen() failed: {}", err));
         }
 
-        Ok(SeqPacketListener { fd })
+        Ok(SeqPacketListener { fd, path: c_path })
     }
 
     pub fn accept(&self) -> Result<c_int, String> {
@@ -188,7 +201,10 @@ impl SeqPacketListener {
 
 impl Drop for SeqPacketListener {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
+        unsafe {
+            libc::close(self.fd);
+            libc::unlink(self.path.as_ptr());
+        }
     }
 }
 
@@ -204,7 +220,7 @@ pub fn generate_random_key() -> i32 {
             .as_nanos();
         buf = (now as u32).to_ne_bytes();
     }
-    i32::from_ne_bytes(buf).abs() % 1000000
+    ((u32::from_ne_bytes(buf) & i32::MAX as u32) % 1_000_000) as i32
 }
 
 fn send_server_message(fd: c_int, msg: &ServerMessage) -> bool {
@@ -229,6 +245,20 @@ fn broadcast_server_message(fb_key: i32, msg: &ServerMessage) {
         send_server_message(fd, msg);
     }
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Dimensions {
+    width: u32,
+    height: u32,
+}
+
+impl Dimensions {
+    const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+type Region = (u32, u32, u32, u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum FramebufferFormat {
@@ -256,11 +286,21 @@ impl FramebufferFormat {
     }
 }
 
-fn default_dimensions(framebuffer_type: u8) -> Option<(u32, u32)> {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Framebuffer {
+    format: FramebufferFormat,
+    dimensions: Dimensions,
+}
+
+fn default_dimensions(framebuffer_type: u8) -> Option<Dimensions> {
     match framebuffer_type {
-        FBFMT_RM2FB => Some((1404, 1872)),
-        FBFMT_RMPP_RGB888 | FBFMT_RMPP_RGBA8888 | FBFMT_RMPP_RGB565 => Some((1620, 2160)),
-        FBFMT_RMPPM_RGB888 | FBFMT_RMPPM_RGBA8888 | FBFMT_RMPPM_RGB565 => Some((954, 1696)),
+        FBFMT_RM2FB => Some(Dimensions::new(1404, 1872)),
+        FBFMT_RMPP_RGB888 | FBFMT_RMPP_RGBA8888 | FBFMT_RMPP_RGB565 => {
+            Some(Dimensions::new(1620, 2160))
+        }
+        FBFMT_RMPPM_RGB888 | FBFMT_RMPPM_RGBA8888 | FBFMT_RMPPM_RGB565 => {
+            Some(Dimensions::new(954, 1696))
+        }
         _ => None,
     }
 }
@@ -273,113 +313,287 @@ fn scale_input(value: i32, physical_extent: u32, framebuffer_extent: u32) -> i32
     }
 }
 
-fn clamp_region(
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    width: u32,
-    height: u32,
-) -> Option<(u32, u32, u32, u32)> {
-    let x = x.max(0).min(width as i32);
-    let y = y.max(0).min(height as i32);
-    let w = w.max(0).min(width as i32 - x);
-    let h = h.max(0).min(height as i32 - y);
+fn clamp_region(x: i32, y: i32, w: i32, h: i32, dimensions: Dimensions) -> Option<Region> {
+    let x = x.max(0).min(dimensions.width as i32);
+    let y = y.max(0).min(dimensions.height as i32);
+    let w = w.max(0).min(dimensions.width as i32 - x);
+    let h = h.max(0).min(dimensions.height as i32 - y);
     (w > 0 && h > 0).then_some((x as u32, y as u32, w as u32, h as u32))
 }
 
-fn scale_region(
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    source_width: u32,
-    source_height: u32,
-    target_width: u32,
-    target_height: u32,
-) -> (u32, u32, u32, u32) {
-    let x0 = x as u64 * target_width as u64 / source_width as u64;
-    let y0 = y as u64 * target_height as u64 / source_height as u64;
-    let x1 = ((x + w) as u64 * target_width as u64 + source_width as u64 - 1) / source_width as u64;
-    let y1 =
-        ((y + h) as u64 * target_height as u64 + source_height as u64 - 1) / source_height as u64;
+fn scale_region(region: Region, source: Dimensions, target: Dimensions) -> Region {
+    let (x, y, w, h) = region;
+    let x0 = x as u64 * target.width as u64 / source.width as u64;
+    let y0 = y as u64 * target.height as u64 / source.height as u64;
+    let x1 = ((x + w) as u64 * target.width as u64).div_ceil(source.width as u64);
+    let y1 = ((y + h) as u64 * target.height as u64).div_ceil(source.height as u64);
     (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+mod neon {
+    use super::FramebufferFormat;
+    #[cfg(target_arch = "aarch64")]
+    use std::arch::aarch64::*;
+    #[cfg(target_arch = "arm")]
+    use std::arch::arm::*;
+
+    /// Converts as many pixels as possible in groups of eight. The caller owns
+    /// the scalar tail and guarantees that both row pointers are valid.
+    pub fn convert_row(
+        source: FramebufferFormat,
+        target_is_rgb16: bool,
+        source_ptr: *const u8,
+        target_ptr: *mut u8,
+        pixels: usize,
+    ) -> usize {
+        if pixels < 8 {
+            return 0;
+        }
+
+        #[cfg(target_arch = "arm")]
+        if !std::arch::is_arm_feature_detected!("neon") {
+            return 0;
+        }
+
+        // SAFETY: AArch64 requires ASIMD. ARMv7 reaches this call only after
+        // runtime NEON detection; the caller provides enough bytes for every
+        // eight-pixel vector load/store.
+        unsafe { convert_row_neon(source, target_is_rgb16, source_ptr, target_ptr, pixels) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn convert_row_neon(
+        source: FramebufferFormat,
+        target_is_rgb16: bool,
+        source_ptr: *const u8,
+        target_ptr: *mut u8,
+        pixels: usize,
+    ) -> usize {
+        let vector_pixels = pixels & !7;
+        let mut offset = 0;
+
+        while offset < vector_pixels {
+            // SAFETY: `convert_row`'s contract guarantees full vector-sized
+            // source and target ranges for every iteration.
+            unsafe {
+                match (source, target_is_rgb16) {
+                    (FramebufferFormat::Rgb565, false) => {
+                        let pixel = vld1q_u16(source_ptr.add(offset * 2) as *const u16);
+                        let r5 = vandq_u16(vshrq_n_u16::<11>(pixel), vdupq_n_u16(0x1f));
+                        let g6 = vandq_u16(vshrq_n_u16::<5>(pixel), vdupq_n_u16(0x3f));
+                        let b5 = vandq_u16(pixel, vdupq_n_u16(0x1f));
+                        let r8 = vmovn_u16(vorrq_u16(vshlq_n_u16::<3>(r5), vshrq_n_u16::<2>(r5)));
+                        let g8 = vmovn_u16(vorrq_u16(vshlq_n_u16::<2>(g6), vshrq_n_u16::<4>(g6)));
+                        let b8 = vmovn_u16(vorrq_u16(vshlq_n_u16::<3>(b5), vshrq_n_u16::<2>(b5)));
+                        vst4_u8(
+                            target_ptr.add(offset * 4),
+                            uint8x8x4_t(r8, g8, b8, vdup_n_u8(0xff)),
+                        );
+                    }
+                    (FramebufferFormat::Rgb888, false) => {
+                        let rgb = vld3_u8(source_ptr.add(offset * 3));
+                        vst4_u8(
+                            target_ptr.add(offset * 4),
+                            uint8x8x4_t(rgb.0, rgb.1, rgb.2, vdup_n_u8(0xff)),
+                        );
+                    }
+                    (FramebufferFormat::Rgb888, true) => {
+                        let rgb = vld3_u8(source_ptr.add(offset * 3));
+                        vst1q_u16(
+                            target_ptr.add(offset * 2) as *mut u16,
+                            pack_rgb565(rgb.0, rgb.1, rgb.2),
+                        );
+                    }
+                    (FramebufferFormat::Rgba8888, true) => {
+                        let rgba = vld4_u8(source_ptr.add(offset * 4));
+                        vst1q_u16(
+                            target_ptr.add(offset * 2) as *mut u16,
+                            pack_rgb565(rgba.0, rgba.1, rgba.2),
+                        );
+                    }
+                    // Matching RGB565/RGB16 and RGBA/RGBA cases use the
+                    // byte-copy fast path; no other format pairs exist.
+                    _ => return offset,
+                }
+            }
+            offset += 8;
+        }
+
+        offset
+    }
+
+    #[target_feature(enable = "neon")]
+    #[allow(unused_unsafe)]
+    unsafe fn pack_rgb565(r: uint8x8_t, g: uint8x8_t, b: uint8x8_t) -> uint16x8_t {
+        // Keep the high 5/6/5 bits of each eight-bit channel in RGB565 layout.
+        unsafe {
+            let r = vandq_u16(vshlq_n_u16::<8>(vmovl_u8(r)), vdupq_n_u16(0xf800));
+            let g = vandq_u16(vshlq_n_u16::<3>(vmovl_u8(g)), vdupq_n_u16(0x07e0));
+            let b = vandq_u16(vmovl_u8(b), vdupq_n_u16(0x001f));
+            vorrq_u16(vorrq_u16(r, g), b)
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+mod neon {
+    use super::FramebufferFormat;
+
+    pub fn convert_row(_: FramebufferFormat, _: bool, _: *const u8, _: *mut u8, _: usize) -> usize {
+        0
+    }
+}
+
+unsafe fn copy_pixel(
+    source_ptr: *const u8,
+    target_ptr: *mut u8,
+    source_format: FramebufferFormat,
+    target_is_rgb16: bool,
+    source_index: usize,
+    target_index: usize,
+) {
+    // SAFETY: Callers calculate in-bounds pixel offsets from validated regions.
+    unsafe {
+        let (r8, g8, b8, a8) = match source_format {
+            FramebufferFormat::Rgb565 => {
+                let pixel = u16::from_ne_bytes([
+                    *source_ptr.add(source_index),
+                    *source_ptr.add(source_index + 1),
+                ]);
+                let r5 = ((pixel >> 11) & 0x1F) as u8;
+                let g6 = ((pixel >> 5) & 0x3F) as u8;
+                let b5 = (pixel & 0x1F) as u8;
+                (
+                    (r5 << 3) | (r5 >> 2),
+                    (g6 << 2) | (g6 >> 4),
+                    (b5 << 3) | (b5 >> 2),
+                    0xFF,
+                )
+            }
+            FramebufferFormat::Rgb888 => (
+                *source_ptr.add(source_index),
+                *source_ptr.add(source_index + 1),
+                *source_ptr.add(source_index + 2),
+                0xFF,
+            ),
+            FramebufferFormat::Rgba8888 => (
+                *source_ptr.add(source_index),
+                *source_ptr.add(source_index + 1),
+                *source_ptr.add(source_index + 2),
+                *source_ptr.add(source_index + 3),
+            ),
+        };
+
+        if target_is_rgb16 {
+            let pixel = ((r8 as u16 >> 3) << 11) | ((g8 as u16 >> 2) << 5) | (b8 as u16 >> 3);
+            let bytes = pixel.to_ne_bytes();
+            *target_ptr.add(target_index) = bytes[0];
+            *target_ptr.add(target_index + 1) = bytes[1];
+        } else {
+            *target_ptr.add(target_index) = r8;
+            *target_ptr.add(target_index + 1) = g8;
+            *target_ptr.add(target_index + 2) = b8;
+            *target_ptr.add(target_index + 3) = a8;
+        }
+    }
+}
+
+fn copy_unscaled_region(
+    source_ptr: *const u8,
+    target_ptr: *mut u8,
+    source: Framebuffer,
+    region: Region,
+    target_is_rgb16: bool,
+) {
+    let (x, y, width, height) = region;
+    let source_bpp = source.format.bytes_per_pixel();
+    let target_bpp = if target_is_rgb16 { 2 } else { 4 };
+
+    for row in y..y + height {
+        let source_row = unsafe {
+            source_ptr
+                .add((row as usize * source.dimensions.width as usize + x as usize) * source_bpp)
+        };
+        let target_row = unsafe {
+            target_ptr
+                .add((row as usize * source.dimensions.width as usize + x as usize) * target_bpp)
+        };
+
+        if matches!(
+            (source.format, target_is_rgb16),
+            (FramebufferFormat::Rgb565, true) | (FramebufferFormat::Rgba8888, false)
+        ) {
+            // SAFETY: source and target point to different framebuffer mappings
+            // and each row range is fully contained in its respective buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(source_row, target_row, width as usize * source_bpp)
+            };
+            continue;
+        }
+
+        let vector_pixels = neon::convert_row(
+            source.format,
+            target_is_rgb16,
+            source_row,
+            target_row,
+            width as usize,
+        );
+        for column in vector_pixels..width as usize {
+            // SAFETY: the scalar tail begins after all vector-sized chunks and
+            // remains within the validated row range.
+            unsafe {
+                copy_pixel(
+                    source_row,
+                    target_row,
+                    source.format,
+                    target_is_rgb16,
+                    column * source_bpp,
+                    column * target_bpp,
+                );
+            }
+        }
+    }
 }
 
 fn copy_region(
     shm_ptr: *const u8,
     blight_ptr: *mut u8,
-    source_width: u32,
-    source_height: u32,
-    target_width: u32,
-    target_height: u32,
-    region: (u32, u32, u32, u32),
+    source: Framebuffer,
+    target: Dimensions,
+    region: Region,
     target_is_rgb16: bool,
-    source_format: FramebufferFormat,
-) -> (u32, u32, u32, u32) {
-    let (x, y, w, h) = region;
-    let target_region = scale_region(
-        x,
-        y,
-        w,
-        h,
-        source_width,
-        source_height,
-        target_width,
-        target_height,
-    );
+) -> Region {
+    let target_region = scale_region(region, source.dimensions, target);
+    if source.dimensions == target {
+        copy_unscaled_region(shm_ptr, blight_ptr, source, region, target_is_rgb16);
+        return target_region;
+    }
+
     let (target_x, target_y, target_w, target_h) = target_region;
 
     for target_row in target_y..target_y + target_h {
-        let source_row = (target_row as u64 * source_height as u64 / target_height as u64) as u32;
+        let source_row =
+            (target_row as u64 * source.dimensions.height as u64 / target.height as u64) as u32;
         for target_col in target_x..target_x + target_w {
-            let source_col = (target_col as u64 * source_width as u64 / target_width as u64) as u32;
-            let source_index = (source_row as usize * source_width as usize + source_col as usize)
-                * source_format.bytes_per_pixel();
-            let target_index = (target_row as usize * target_width as usize + target_col as usize)
+            let source_col =
+                (target_col as u64 * source.dimensions.width as u64 / target.width as u64) as u32;
+            let source_index = (source_row as usize * source.dimensions.width as usize
+                + source_col as usize)
+                * source.format.bytes_per_pixel();
+            let target_index = (target_row as usize * target.width as usize + target_col as usize)
                 * if target_is_rgb16 { 2 } else { 4 };
+            // SAFETY: clamped input and scaled output regions keep both pixel
+            // indices inside their corresponding framebuffer mappings.
             unsafe {
-                let (r8, g8, b8, a8) = match source_format {
-                    FramebufferFormat::Rgb565 => {
-                        let pixel = u16::from_ne_bytes([
-                            *shm_ptr.add(source_index),
-                            *shm_ptr.add(source_index + 1),
-                        ]);
-                        let r5 = ((pixel >> 11) & 0x1F) as u8;
-                        let g6 = ((pixel >> 5) & 0x3F) as u8;
-                        let b5 = (pixel & 0x1F) as u8;
-                        (
-                            (r5 << 3) | (r5 >> 2),
-                            (g6 << 2) | (g6 >> 4),
-                            (b5 << 3) | (b5 >> 2),
-                            0xFF,
-                        )
-                    }
-                    FramebufferFormat::Rgb888 => (
-                        *shm_ptr.add(source_index),
-                        *shm_ptr.add(source_index + 1),
-                        *shm_ptr.add(source_index + 2),
-                        0xFF,
-                    ),
-                    FramebufferFormat::Rgba8888 => (
-                        *shm_ptr.add(source_index),
-                        *shm_ptr.add(source_index + 1),
-                        *shm_ptr.add(source_index + 2),
-                        *shm_ptr.add(source_index + 3),
-                    ),
-                };
-                if target_is_rgb16 {
-                    let pixel =
-                        ((r8 as u16 >> 3) << 11) | ((g8 as u16 >> 2) << 5) | (b8 as u16 >> 3);
-                    let bytes = pixel.to_ne_bytes();
-                    *blight_ptr.add(target_index) = bytes[0];
-                    *blight_ptr.add(target_index + 1) = bytes[1];
-                } else {
-                    *blight_ptr.add(target_index) = r8;
-                    *blight_ptr.add(target_index + 1) = g8;
-                    *blight_ptr.add(target_index + 2) = b8;
-                    *blight_ptr.add(target_index + 3) = a8;
-                }
+                copy_pixel(
+                    shm_ptr,
+                    blight_ptr,
+                    source.format,
+                    target_is_rgb16,
+                    source_index,
+                    target_index,
+                );
             }
         }
     }
@@ -392,20 +606,16 @@ use std::sync::OnceLock;
 
 #[derive(Clone)]
 struct ActiveBackend {
-    shm_key: i32,
-    shm_size: usize,
-    shm_ptr: *mut c_void,
-    shm_name: String,
-    framebuffer_format: FramebufferFormat,
-    framebuffer_width: u32,
-    framebuffer_height: u32,
+    shm: Arc<ShmSegment>,
+    framebuffer: Framebuffer,
     blight_buf_ptr: *mut crate::blight::BlightBuf,
     surface_id: u16,
     client_fds: Vec<c_int>,
     input_running: Arc<AtomicBool>,
-    ref_count: usize,
 }
 
+// libblight owns the backing buffer's lifetime. Access is serialized by the
+// QTFB protocol handler and its surface connection thread.
 unsafe impl Send for ActiveBackend {}
 unsafe impl Sync for ActiveBackend {}
 
@@ -415,78 +625,63 @@ fn get_backends() -> &'static Mutex<HashMap<i32, ActiveBackend>> {
     BACKENDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+enum ClientDetach {
+    Last(ActiveBackend),
+    StillAttached(usize),
+    NotAttached,
+}
 
-    #[test]
-    fn qtfb_framebuffer_formats_have_the_reference_byte_sizes() {
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RM2FB)
-                .unwrap()
-                .bytes_per_pixel(),
-            2
-        );
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RMPP_RGB888)
-                .unwrap()
-                .bytes_per_pixel(),
-            3
-        );
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RMPP_RGBA8888)
-                .unwrap()
-                .bytes_per_pixel(),
-            4
-        );
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RMPP_RGB565)
-                .unwrap()
-                .bytes_per_pixel(),
-            2
-        );
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RMPPM_RGB888)
-                .unwrap()
-                .bytes_per_pixel(),
-            3
-        );
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RMPPM_RGBA8888)
-                .unwrap()
-                .bytes_per_pixel(),
-            4
-        );
-        assert_eq!(
-            FramebufferFormat::from_qtfb(FBFMT_RMPPM_RGB565)
-                .unwrap()
-                .bytes_per_pixel(),
-            2
-        );
-        assert!(FramebufferFormat::from_qtfb(255).is_err());
-    }
+fn detach_client(fb_key: i32, client_fd: c_int) -> ClientDetach {
+    let mut backends = get_backends().lock().unwrap();
+    let Some(backend) = backends.get_mut(&fb_key) else {
+        return ClientDetach::NotAttached;
+    };
 
-    #[test]
-    fn qtfb_default_dimensions_match_the_requested_format() {
-        assert_eq!(default_dimensions(FBFMT_RM2FB), Some((1404, 1872)));
-        assert_eq!(default_dimensions(FBFMT_RMPP_RGB888), Some((1620, 2160)));
-        assert_eq!(default_dimensions(FBFMT_RMPPM_RGB888), Some((954, 1696)));
-    }
-
-    #[test]
-    fn scaled_region_covers_the_corresponding_physical_area() {
-        assert_eq!(
-            scale_region(0, 0, 1404, 1872, 1404, 1872, 1620, 2160),
-            (0, 0, 1620, 2160)
-        );
-        assert_eq!(
-            scale_region(702, 936, 1, 1, 1404, 1872, 1620, 2160),
-            (810, 1080, 2, 2)
-        );
+    backend.client_fds.retain(|&fd| fd != client_fd);
+    if backend.client_fds.is_empty() {
+        ClientDetach::Last(
+            backends
+                .remove(&fb_key)
+                .expect("backend disappeared while holding its mutex"),
+        )
+    } else {
+        ClientDetach::StillAttached(backend.client_fds.len())
     }
 }
 
-pub fn handle_client(
+fn cleanup_client_connection(
+    fb_key: i32,
+    client_fd: c_int,
+    libblight: &LibBlight,
+    blight_fd: c_int,
+) {
+    match detach_client(fb_key, client_fd) {
+        ClientDetach::Last(backend) => {
+            println!(
+                "[server] Last connection for fb_key {} disconnected, destroying backend",
+                fb_key
+            );
+            backend.input_running.store(false, Ordering::Relaxed);
+            if let Err(e) = libblight.remove_surface(blight_fd, backend.surface_id) {
+                println!("[server] Failed to remove surface: {}", e);
+            }
+            unsafe { libblight.buffer_deref(backend.blight_buf_ptr) };
+        }
+        ClientDetach::StillAttached(connection_count) => {
+            println!(
+                "[server] Backend for fb_key {} still has {} active connections",
+                fb_key, connection_count
+            );
+        }
+        ClientDetach::NotAttached => {}
+    }
+}
+
+/// # Safety
+///
+/// `bus` must be a live libblight bus handle for the entire client-handler
+/// lifetime. It is shared with the main libblight service connection.
+pub unsafe fn handle_client(
     client_fd: c_int,
     libblight: Arc<LibBlight>,
     bus: *mut BlightBus,
@@ -527,7 +722,10 @@ pub fn handle_client(
         (
             custom_init.framebuffer_key,
             custom_init.framebuffer_type,
-            Some((custom_init.width as u32, custom_init.height as u32)),
+            Some(Dimensions::new(
+                custom_init.width as u32,
+                custom_init.height as u32,
+            )),
         )
     } else {
         println!(
@@ -547,8 +745,8 @@ pub fn handle_client(
         }
     };
 
-    let (width, height) = match custom_dimensions.or_else(|| default_dimensions(framebuffer_type)) {
-        Some(dimensions) if dimensions.0 > 0 && dimensions.1 > 0 => dimensions,
+    let dimensions = match custom_dimensions.or_else(|| default_dimensions(framebuffer_type)) {
+        Some(dimensions) if dimensions.width > 0 && dimensions.height > 0 => dimensions,
         _ => {
             println!("[server] invalid framebuffer dimensions");
             unsafe { libc::close(client_fd) };
@@ -556,15 +754,19 @@ pub fn handle_client(
         }
     };
 
+    let framebuffer = Framebuffer {
+        format: framebuffer_format,
+        dimensions,
+    };
+
     let is_rgb16 = profile.format == BlightImageFormat::FormatRGB16;
-    let shm_size = (width as usize) * (height as usize) * framebuffer_format.bytes_per_pixel();
+    let shm_size = dimensions.width as usize
+        * dimensions.height as usize
+        * framebuffer_format.bytes_per_pixel();
 
     let mut backends = get_backends().lock().unwrap();
     let backend_info = if let Some(backend) = backends.get_mut(&fb_key) {
-        if backend.framebuffer_format != framebuffer_format
-            || backend.framebuffer_width != width
-            || backend.framebuffer_height != height
-        {
+        if backend.framebuffer != framebuffer {
             println!(
                 "[server] Refusing incompatible attachment for fb_key {}",
                 fb_key
@@ -572,11 +774,10 @@ pub fn handle_client(
             unsafe { libc::close(client_fd) };
             return;
         }
-        backend.ref_count += 1;
         backend.client_fds.push(client_fd);
         println!(
-            "[server] Reusing existing backend for fb_key {}. ref_count is now {}, client FDs: {:?}",
-            fb_key, backend.ref_count, backend.client_fds
+            "[server] Reusing existing backend for fb_key {}. Client FDs: {:?}",
+            fb_key, backend.client_fds
         );
         backend.clone()
     } else {
@@ -601,7 +802,7 @@ pub fn handle_client(
         }
 
         let shm = match shm {
-            Some(s) => s,
+            Some(shm) => Arc::new(shm),
             None => {
                 println!("[server] Failed to create SHM segment after 10 attempts");
                 unsafe { libc::close(client_fd) };
@@ -611,15 +812,15 @@ pub fn handle_client(
 
         // 3. Create Blight buffer and surface
         let blight_stride = profile.width * if is_rgb16 { 2 } else { 4 };
-        let blight_buf_ptr = match libblight.create_buffer(
-            0,
-            0,
-            profile.width,
-            profile.height,
-            blight_stride,
-            profile.format,
-            1.0,
-        ) {
+        let blight_buf_ptr = match libblight.create_buffer(BlightBufferSpec {
+            x: 0,
+            y: 0,
+            width: profile.width,
+            height: profile.height,
+            stride: blight_stride,
+            format: profile.format,
+            scale: 1.0,
+        }) {
             Ok(b) => b,
             Err(e) => {
                 println!("[server] blight_create_buffer failed: {}", e);
@@ -628,11 +829,11 @@ pub fn handle_client(
             }
         };
 
-        let surface_id = match libblight.add_surface(bus, blight_buf_ptr) {
+        let surface_id = match unsafe { libblight.add_surface(bus, blight_buf_ptr) } {
             Ok(id) => id,
             Err(e) => {
                 println!("[server] blight_add_surface failed: {}", e);
-                libblight.buffer_deref(blight_buf_ptr);
+                unsafe { libblight.buffer_deref(blight_buf_ptr) };
                 unsafe { libc::close(client_fd) };
                 return;
             }
@@ -649,8 +850,7 @@ pub fn handle_client(
         let touch_lib = Arc::clone(&libblight);
         let touch_running = Arc::clone(&input_running);
         let touch_profile = profile.clone();
-        let touch_width = width;
-        let touch_height = height;
+        let touch_dimensions = dimensions;
         let touch_surface_id = surface_id;
         let touch_blight_fd = blight_fd;
         std::thread::spawn(move || {
@@ -661,22 +861,23 @@ pub fn handle_client(
                     return;
                 }
             };
-            let touch_buf =
-                match touch_lib.service_input_open(thread_bus, touch_profile.touch_device) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        println!(
-                            "[touch_thread] Failed to open input buffer for touch (device {}): {}",
-                            touch_profile.touch_device, e
-                        );
-                        touch_lib.deref_bus(thread_bus);
-                        return;
-                    }
-                };
+            let touch_buf = match unsafe {
+                touch_lib.service_input_open(thread_bus, touch_profile.touch_device)
+            } {
+                Ok(b) => b,
+                Err(e) => {
+                    println!(
+                        "[touch_thread] Failed to open input buffer for touch (device {}): {}",
+                        touch_profile.touch_device, e
+                    );
+                    unsafe { touch_lib.deref_bus(thread_bus) };
+                    return;
+                }
+            };
 
-            let mut last_tracking_ids = vec![-1; 16];
-            let mut last_x = vec![0; 16];
-            let mut last_y = vec![0; 16];
+            let mut last_tracking_ids = [-1; 16];
+            let mut last_x = [0; 16];
+            let mut last_y = [0; 16];
 
             #[derive(Copy, Clone)]
             struct SlotState {
@@ -696,10 +897,10 @@ pub fn handle_client(
             let mut five_finger_refresh_sent = false;
 
             while touch_running.load(Ordering::Relaxed) {
-                match touch_lib.event_from_buffer(touch_buf, true) {
+                match unsafe { touch_lib.event_from_buffer(touch_buf, true) } {
                     Ok(ev_ptr) => {
                         let ev = unsafe { *ev_ptr };
-                        touch_lib.event_free(ev_ptr);
+                        unsafe { touch_lib.event_free(ev_ptr) };
 
                         if ev.type_ == EV_ABS {
                             if ev.code == ABS_MT_SLOT {
@@ -722,14 +923,16 @@ pub fn handle_client(
                             if active_touches == 5 && !five_finger_refresh_sent {
                                 if let Err(e) = touch_lib.surface_repaint(
                                     touch_blight_fd,
-                                    touch_surface_id,
-                                    0,
-                                    0,
-                                    touch_profile.width,
-                                    touch_profile.height,
-                                    BlightWaveformMode::Full,
-                                    touch_profile.color_type,
-                                    BlightUpdateMode::FullUpdate,
+                                    BlightRepaintRequest {
+                                        surface_id: touch_surface_id,
+                                        x: 0,
+                                        y: 0,
+                                        width: touch_profile.width,
+                                        height: touch_profile.height,
+                                        waveform: BlightWaveformMode::Full,
+                                        content_type: touch_profile.color_type,
+                                        update_mode: BlightUpdateMode::FullUpdate,
+                                    },
                                 ) {
                                     println!(
                                         "[touch_thread] five-finger full refresh failed: {}",
@@ -769,10 +972,16 @@ pub fn handle_client(
 
                                         let (raw_mx, raw_my) =
                                             touch_profile.transform_touch(raw_x, raw_y);
-                                        let mx =
-                                            scale_input(raw_mx, touch_profile.width, touch_width);
-                                        let my =
-                                            scale_input(raw_my, touch_profile.height, touch_height);
+                                        let mx = scale_input(
+                                            raw_mx,
+                                            touch_profile.width,
+                                            touch_dimensions.width,
+                                        );
+                                        let my = scale_input(
+                                            raw_my,
+                                            touch_profile.height,
+                                            touch_dimensions.height,
+                                        );
 
                                         let event_dev_id = if id != -1 { id } else { last_id };
                                         let resp = ServerMessage {
@@ -797,8 +1006,8 @@ pub fn handle_client(
                     Err(_) => break,
                 }
             }
-            touch_lib.input_buffer_deref(touch_buf);
-            touch_lib.deref_bus(thread_bus);
+            unsafe { touch_lib.input_buffer_deref(touch_buf) };
+            unsafe { touch_lib.deref_bus(thread_bus) };
             println!("[touch_thread] Touch thread terminated");
         });
 
@@ -806,8 +1015,7 @@ pub fn handle_client(
         let pen_lib = Arc::clone(&libblight);
         let pen_running = Arc::clone(&input_running);
         let pen_profile = profile.clone();
-        let pen_width = width;
-        let pen_height = height;
+        let pen_dimensions = dimensions;
         std::thread::spawn(move || {
             let thread_bus = match pen_lib.connect_bus() {
                 Ok(b) => b,
@@ -816,17 +1024,18 @@ pub fn handle_client(
                     return;
                 }
             };
-            let pen_buf = match pen_lib.service_input_open(thread_bus, pen_profile.pen_device) {
-                Ok(b) => b,
-                Err(e) => {
-                    println!(
-                        "[pen_thread] Failed to open pen input buffer (device {}): {}",
-                        pen_profile.pen_device, e
-                    );
-                    pen_lib.deref_bus(thread_bus);
-                    return;
-                }
-            };
+            let pen_buf =
+                match unsafe { pen_lib.service_input_open(thread_bus, pen_profile.pen_device) } {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!(
+                            "[pen_thread] Failed to open pen input buffer (device {}): {}",
+                            pen_profile.pen_device, e
+                        );
+                        unsafe { pen_lib.deref_bus(thread_bus) };
+                        return;
+                    }
+                };
 
             let mut raw_x = 0;
             let mut raw_y = 0;
@@ -836,10 +1045,10 @@ pub fn handle_client(
             let mut dirty = false;
 
             while pen_running.load(Ordering::Relaxed) {
-                match pen_lib.event_from_buffer(pen_buf, true) {
+                match unsafe { pen_lib.event_from_buffer(pen_buf, true) } {
                     Ok(ev_ptr) => {
                         let ev = unsafe { *ev_ptr };
-                        pen_lib.event_free(ev_ptr);
+                        unsafe { pen_lib.event_free(ev_ptr) };
 
                         if ev.type_ == EV_ABS {
                             if ev.code == ABS_X {
@@ -857,44 +1066,42 @@ pub fn handle_client(
                                 touching = ev.value == 1;
                                 dirty = true;
                             }
-                        } else if ev.type_ == EV_SYN && ev.code == SYN_REPORT {
-                            if dirty {
-                                let input_type = if touching && !last_touching {
-                                    INPUT_PEN_PRESS
-                                } else if !touching && last_touching {
-                                    INPUT_PEN_RELEASE
-                                } else {
-                                    INPUT_PEN_UPDATE
-                                };
+                        } else if ev.type_ == EV_SYN && ev.code == SYN_REPORT && dirty {
+                            let input_type = if touching && !last_touching {
+                                INPUT_PEN_PRESS
+                            } else if !touching && last_touching {
+                                INPUT_PEN_RELEASE
+                            } else {
+                                INPUT_PEN_UPDATE
+                            };
 
-                                let (raw_mx, raw_my, md) =
-                                    pen_profile.transform_pen(raw_x, raw_y, raw_pressure);
-                                let mx = scale_input(raw_mx, pen_profile.width, pen_width);
-                                let my = scale_input(raw_my, pen_profile.height, pen_height);
+                            let (raw_mx, raw_my, md) =
+                                pen_profile.transform_pen(raw_x, raw_y, raw_pressure);
+                            let mx = scale_input(raw_mx, pen_profile.width, pen_dimensions.width);
+                            let my = scale_input(raw_my, pen_profile.height, pen_dimensions.height);
 
-                                let resp = ServerMessage {
-                                    msg_type: MESSAGE_USERINPUT,
-                                    payload: ServerMessageUnion {
-                                        user_input: UserInputContents {
-                                            input_type,
-                                            dev_id: 0,
-                                            x: mx,
-                                            y: my,
-                                            d: md,
-                                        },
+                            let resp = ServerMessage {
+                                msg_type: MESSAGE_USERINPUT,
+                                payload: ServerMessageUnion {
+                                    user_input: UserInputContents {
+                                        input_type,
+                                        dev_id: 0,
+                                        x: mx,
+                                        y: my,
+                                        d: md,
                                     },
-                                };
-                                broadcast_server_message(fb_key, &resp);
-                                last_touching = touching;
-                                dirty = false;
-                            }
+                                },
+                            };
+                            broadcast_server_message(fb_key, &resp);
+                            last_touching = touching;
+                            dirty = false;
                         }
                     }
                     Err(_) => break,
                 }
             }
-            pen_lib.input_buffer_deref(pen_buf);
-            pen_lib.deref_bus(thread_bus);
+            unsafe { pen_lib.input_buffer_deref(pen_buf) };
+            unsafe { pen_lib.deref_bus(thread_bus) };
             println!("[pen_thread] Pen thread terminated");
         });
 
@@ -909,36 +1116,40 @@ pub fn handle_client(
                     return;
                 }
             };
-            let btn_buf = match btn_lib.service_input_open(thread_bus, btn_profile.button_device) {
+            let btn_buf = match unsafe {
+                btn_lib.service_input_open(thread_bus, btn_profile.button_device)
+            } {
                 Ok(b) => b,
                 Err(_) => {
-                    btn_lib.deref_bus(thread_bus);
+                    unsafe { btn_lib.deref_bus(thread_bus) };
                     return;
                 }
             };
 
             while btn_running.load(Ordering::Relaxed) {
-                match btn_lib.event_from_buffer(btn_buf, true) {
+                match unsafe { btn_lib.event_from_buffer(btn_buf, true) } {
                     Ok(ev_ptr) => {
                         let ev = unsafe { *ev_ptr };
-                        btn_lib.event_free(ev_ptr);
+                        unsafe { btn_lib.event_free(ev_ptr) };
 
                         if ev.type_ == EV_KEY {
                             let key_idx = if ev.code == 105 {
-                                0 // LEFT
+                                INPUT_BTN_X_LEFT
                             } else if ev.code == 102 {
-                                1 // HOME
+                                INPUT_BTN_X_HOME
                             } else if ev.code == 106 {
-                                2 // RIGHT
+                                INPUT_BTN_X_RIGHT
                             } else {
                                 -1
                             };
 
                             if key_idx >= 0 {
-                                let input_type = if ev.value == 1 {
-                                    INPUT_BTN_PRESS
-                                } else {
+                                let input_type = if ev.value == 0 {
                                     INPUT_BTN_RELEASE
+                                } else {
+                                    // Linux reports key-repeat as 2; QTFB treats it as another
+                                    // press rather than a release.
+                                    INPUT_BTN_PRESS
                                 };
                                 let resp = ServerMessage {
                                     msg_type: MESSAGE_USERINPUT,
@@ -959,27 +1170,20 @@ pub fn handle_client(
                     Err(_) => break,
                 }
             }
-            btn_lib.input_buffer_deref(btn_buf);
-            btn_lib.deref_bus(thread_bus);
+            unsafe { btn_lib.input_buffer_deref(btn_buf) };
+            unsafe { btn_lib.deref_bus(thread_bus) };
             println!("[btn_thread] Buttons thread terminated");
         });
 
         let new_backend = ActiveBackend {
-            shm_key: try_key,
-            shm_size,
-            shm_ptr: shm.ptr,
-            shm_name: shm.name.clone(),
-            framebuffer_format,
-            framebuffer_width: width,
-            framebuffer_height: height,
+            shm,
+            framebuffer,
             blight_buf_ptr,
             surface_id,
             client_fds: vec![client_fd],
             input_running: Arc::clone(&input_running),
-            ref_count: 1,
         };
 
-        std::mem::forget(shm);
         backends.insert(fb_key, new_backend.clone());
         new_backend
     };
@@ -990,30 +1194,15 @@ pub fn handle_client(
         msg_type: MESSAGE_INITIALIZE,
         payload: ServerMessageUnion {
             init: InitMessageResponseContents {
-                shm_key_defined: backend_info.shm_key,
-                shm_size: backend_info.shm_size,
+                shm_key_defined: backend_info.shm.key,
+                shm_size: backend_info.shm.size,
             },
         },
     };
 
     if !send_server_message(client_fd, &resp) {
         println!("[server] Failed to send init response to client");
-        let mut backends = get_backends().lock().unwrap();
-        if let Some(backend) = backends.get_mut(&fb_key) {
-            backend.ref_count -= 1;
-            backend.client_fds.retain(|&fd| fd != client_fd);
-            if backend.ref_count == 0 {
-                backend_info.input_running.store(false, Ordering::Relaxed);
-                let _ = libblight.remove_surface(blight_fd, backend_info.surface_id);
-                libblight.buffer_deref(backend_info.blight_buf_ptr);
-                let _shm_segment = ShmSegment {
-                    name: backend_info.shm_name.clone(),
-                    ptr: backend_info.shm_ptr,
-                    size: backend_info.shm_size,
-                };
-                backends.remove(&fb_key);
-            }
-        }
+        cleanup_client_connection(fb_key, client_fd, &libblight, blight_fd);
         unsafe { libc::close(client_fd) };
         return;
     }
@@ -1021,7 +1210,7 @@ pub fn handle_client(
     let input_running = Arc::clone(&backend_info.input_running);
 
     // 6. Main server message loop
-    let mut refresh_mode = 4; // Default to UI (REFRESH_MODE_UI)
+    let mut refresh_mode = REFRESH_MODE_UI;
     let mut last_loop_time = std::time::Instant::now();
 
     let mut poll_client = libc::pollfd {
@@ -1088,7 +1277,7 @@ pub fn handle_client(
             MESSAGE_UPDATE => {
                 let update = unsafe { client_msg.payload.update };
                 let (x, y, w, h) = match update.update_type {
-                    UPDATE_ALL => (0, 0, width as i32, height as i32),
+                    UPDATE_ALL => (0, 0, dimensions.width as i32, dimensions.height as i32),
                     UPDATE_PARTIAL => (update.x, update.y, update.w, update.h),
                     other => {
                         println!("[server] Ignoring unknown update type {}", other);
@@ -1096,45 +1285,44 @@ pub fn handle_client(
                     }
                 };
 
-                let Some(region) = clamp_region(x, y, w, h, width, height) else {
+                let Some(region) = clamp_region(x, y, w, h, dimensions) else {
                     continue;
                 };
 
                 let (target_x, target_y, target_w, target_h) = unsafe {
                     let blight_buf = &*backend_info.blight_buf_ptr;
                     copy_region(
-                        backend_info.shm_ptr as *const u8,
+                        backend_info.shm.ptr as *const u8,
                         blight_buf.data,
-                        width,
-                        height,
-                        profile.width,
-                        profile.height,
+                        backend_info.framebuffer,
+                        Dimensions::new(profile.width, profile.height),
                         region,
                         is_rgb16,
-                        backend_info.framebuffer_format,
                     )
                 };
 
                 // Map refresh_mode to waveform mode
                 let waveform = match refresh_mode {
-                    0 => BlightWaveformMode::UltraFast,
-                    1 => BlightWaveformMode::Fast,
-                    2 => BlightWaveformMode::Animate,
-                    3 => BlightWaveformMode::Content,
-                    4 => BlightWaveformMode::UI,
+                    REFRESH_MODE_ULTRA_FAST => BlightWaveformMode::UltraFast,
+                    REFRESH_MODE_FAST => BlightWaveformMode::Fast,
+                    REFRESH_MODE_ANIMATE => BlightWaveformMode::Animate,
+                    REFRESH_MODE_CONTENT => BlightWaveformMode::Content,
+                    REFRESH_MODE_UI => BlightWaveformMode::UI,
                     _ => BlightWaveformMode::UI,
                 };
 
                 let repaint_res = libblight.surface_repaint(
                     blight_fd,
-                    backend_info.surface_id,
-                    target_x as i32,
-                    target_y as i32,
-                    target_w,
-                    target_h,
-                    waveform,
-                    profile.color_type,
-                    BlightUpdateMode::PartialUpdate,
+                    BlightRepaintRequest {
+                        surface_id: backend_info.surface_id,
+                        x: target_x as i32,
+                        y: target_y as i32,
+                        width: target_w,
+                        height: target_h,
+                        waveform,
+                        content_type: profile.color_type,
+                        update_mode: BlightUpdateMode::PartialUpdate,
+                    },
                 );
                 if let Err(e) = repaint_res {
                     println!("[server] blight_surface_repaint failed: {}", e);
@@ -1142,6 +1330,10 @@ pub fn handle_client(
             }
             MESSAGE_SET_REFRESH_MODE => {
                 let mode = unsafe { client_msg.payload.refresh_mode };
+                if !(REFRESH_MODE_ULTRA_FAST..=REFRESH_MODE_UI).contains(&mode) {
+                    println!("[server] Invalid refresh mode: {}", mode);
+                    break;
+                }
                 refresh_mode = mode;
                 println!("[server] Set refresh mode: {}", refresh_mode);
             }
@@ -1150,14 +1342,16 @@ pub fn handle_client(
                 // Trigger full refresh
                 let repaint_res = libblight.surface_repaint(
                     blight_fd,
-                    backend_info.surface_id,
-                    0,
-                    0,
-                    profile.width,
-                    profile.height,
-                    BlightWaveformMode::Full,
-                    profile.color_type,
-                    BlightUpdateMode::FullUpdate,
+                    BlightRepaintRequest {
+                        surface_id: backend_info.surface_id,
+                        x: 0,
+                        y: 0,
+                        width: profile.width,
+                        height: profile.height,
+                        waveform: BlightWaveformMode::Full,
+                        content_type: profile.color_type,
+                        update_mode: BlightUpdateMode::FullUpdate,
+                    },
                 );
                 if let Err(e) = repaint_res {
                     println!("[server] blight_surface_repaint full failed: {}", e);
@@ -1175,36 +1369,154 @@ pub fn handle_client(
 
     // Clean up
     println!("[server] Cleaning up client connection...");
-    let mut backends = get_backends().lock().unwrap();
-    if let Some(backend) = backends.get_mut(&fb_key) {
-        backend.ref_count -= 1;
-        backend.client_fds.retain(|&fd| fd != client_fd);
-        if backend.ref_count == 0 {
-            println!(
-                "[server] Last connection for fb_key {} disconnected, destroying backend",
-                fb_key
-            );
-            // Stop input forwarding before removing the backend from the
-            // broadcast map.  Do not stop it for a still-attached keepalive
-            // connection sharing this framebuffer.
-            backend.input_running.store(false, Ordering::Relaxed);
-            let _ = libblight.remove_surface(blight_fd, backend.surface_id);
-            libblight.buffer_deref(backend.blight_buf_ptr);
-            let _shm_segment = ShmSegment {
-                name: backend.shm_name.clone(),
-                ptr: backend.shm_ptr,
-                size: backend.shm_size,
-            };
-            backends.remove(&fb_key);
-        } else {
-            println!(
-                "[server] Backend for fb_key {} still has {} active connections",
-                fb_key, backend.ref_count
-            );
-        }
-    }
-    drop(backends);
+    cleanup_client_connection(fb_key, client_fd, &libblight, blight_fd);
 
     unsafe { libc::close(client_fd) };
     println!("[server] Client handler exit");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qtfb_framebuffer_formats_have_the_reference_byte_sizes() {
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RM2FB)
+                .unwrap()
+                .bytes_per_pixel(),
+            2
+        );
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RMPP_RGB888)
+                .unwrap()
+                .bytes_per_pixel(),
+            3
+        );
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RMPP_RGBA8888)
+                .unwrap()
+                .bytes_per_pixel(),
+            4
+        );
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RMPP_RGB565)
+                .unwrap()
+                .bytes_per_pixel(),
+            2
+        );
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RMPPM_RGB888)
+                .unwrap()
+                .bytes_per_pixel(),
+            3
+        );
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RMPPM_RGBA8888)
+                .unwrap()
+                .bytes_per_pixel(),
+            4
+        );
+        assert_eq!(
+            FramebufferFormat::from_qtfb(FBFMT_RMPPM_RGB565)
+                .unwrap()
+                .bytes_per_pixel(),
+            2
+        );
+        assert!(FramebufferFormat::from_qtfb(255).is_err());
+    }
+
+    #[test]
+    fn qtfb_default_dimensions_match_the_requested_format() {
+        assert_eq!(
+            default_dimensions(FBFMT_RM2FB),
+            Some(Dimensions::new(1404, 1872))
+        );
+        assert_eq!(
+            default_dimensions(FBFMT_RMPP_RGB888),
+            Some(Dimensions::new(1620, 2160))
+        );
+        assert_eq!(
+            default_dimensions(FBFMT_RMPPM_RGB888),
+            Some(Dimensions::new(954, 1696))
+        );
+    }
+
+    #[test]
+    fn scaled_region_covers_the_corresponding_physical_area() {
+        assert_eq!(
+            scale_region(
+                (0, 0, 1404, 1872),
+                Dimensions::new(1404, 1872),
+                Dimensions::new(1620, 2160),
+            ),
+            (0, 0, 1620, 2160)
+        );
+        assert_eq!(
+            scale_region(
+                (702, 936, 1, 1),
+                Dimensions::new(1404, 1872),
+                Dimensions::new(1620, 2160),
+            ),
+            (810, 1080, 2, 2)
+        );
+    }
+
+    fn copy_unscaled_pixels(
+        source_bytes: &[u8],
+        source_format: FramebufferFormat,
+        target_is_rgb16: bool,
+    ) -> Vec<u8> {
+        let dimensions = Dimensions::new(2, 1);
+        let mut target = vec![0; 2 * if target_is_rgb16 { 2 } else { 4 }];
+        let copied = copy_region(
+            source_bytes.as_ptr(),
+            target.as_mut_ptr(),
+            Framebuffer {
+                format: source_format,
+                dimensions,
+            },
+            dimensions,
+            (0, 0, 2, 1),
+            target_is_rgb16,
+        );
+        assert_eq!(copied, (0, 0, 2, 1));
+        target
+    }
+
+    #[test]
+    fn rgb888_converts_to_rgba8888() {
+        assert_eq!(
+            copy_unscaled_pixels(
+                &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+                FramebufferFormat::Rgb888,
+                false
+            ),
+            vec![0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff]
+        );
+    }
+
+    #[test]
+    fn rgba8888_converts_to_rgb565() {
+        let actual = copy_unscaled_pixels(
+            &[0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff],
+            FramebufferFormat::Rgba8888,
+            true,
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0xf800_u16.to_ne_bytes());
+        expected.extend_from_slice(&0x07e0_u16.to_ne_bytes());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rgb565_fast_path_preserves_pixels() {
+        let mut source = Vec::new();
+        source.extend_from_slice(&0x1234_u16.to_ne_bytes());
+        source.extend_from_slice(&0xabcd_u16.to_ne_bytes());
+        assert_eq!(
+            copy_unscaled_pixels(&source, FramebufferFormat::Rgb565, true),
+            source
+        );
+    }
 }

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    target_arch = "arm",
+    feature(
+        arm_target_feature,
+        stdarch_arm_feature_detection,
+        stdarch_arm_neon_intrinsics
+    )
+)]
+
 // SPDX-License-Identifier: GPL-3.0-only
 /*
  * qtfblight - QTFB to libblight compatibility layer
@@ -94,11 +103,11 @@ fn main() {
     };
 
     // 5. Open Blight Service
-    let blight_fd = match libblight.service_open(bus) {
+    let blight_fd = match unsafe { libblight.service_open(bus) } {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("[main] Error opening blight service: {}", e);
-            libblight.deref_bus(bus);
+            unsafe { libblight.deref_bus(bus) };
             std::process::exit(1);
         }
     };
@@ -112,7 +121,7 @@ fn main() {
                 socket_path, e
             );
             unsafe { libc::close(blight_fd) };
-            libblight.deref_bus(bus);
+            unsafe { libblight.deref_bus(bus) };
             std::process::exit(1);
         }
     };
@@ -149,7 +158,7 @@ fn main() {
             Err(e) => {
                 eprintln!("[main] Failed to spawn child process: {}", e);
                 unsafe { libc::close(blight_fd) };
-                libblight.deref_bus(bus);
+                unsafe { libblight.deref_bus(bus) };
                 std::process::exit(1);
             }
         }
@@ -163,7 +172,7 @@ fn main() {
         Err(e) => {
             eprintln!("[main] Error starting blight connection thread: {}", e);
             unsafe { libc::close(blight_fd) };
-            libblight.deref_bus(bus);
+            unsafe { libblight.deref_bus(bus) };
             std::process::exit(1);
         }
     };
@@ -220,15 +229,17 @@ fn main() {
                     let bus_send = SendPtr(bus);
                     active_handlers.fetch_add(1, Ordering::SeqCst);
                     std::thread::spawn(move || {
-                        server::handle_client(
-                            client_fd,
-                            libblight_clone,
-                            bus_send.get(),
-                            blight_fd,
-                            profile_clone,
-                            running_arc_clone,
-                            key,
-                        );
+                        unsafe {
+                            server::handle_client(
+                                client_fd,
+                                libblight_clone,
+                                bus_send.get(),
+                                blight_fd,
+                                profile_clone,
+                                running_arc_clone,
+                                key,
+                            );
+                        }
                         active_handlers_clone.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
@@ -245,12 +256,12 @@ fn main() {
     }
 
     println!("[main] Shutting down, cleaning up socket...");
-    // Cleanup of socket path is handled by drop of listener, which unlinks it and closes the fd.
+    // The listener owns and removes the socket path when it is dropped.
     // The thread must outlive every surface deletion, but be joined before the
     // service FD itself is closed.
-    libblight.connection_thread_deref(blight_thread);
+    unsafe { libblight.connection_thread_deref(blight_thread) };
     unsafe { libc::close(blight_fd) };
-    libblight.deref_bus(bus);
+    unsafe { libblight.deref_bus(bus) };
     println!("[main] Shutdown complete");
 
     if child.is_some() {

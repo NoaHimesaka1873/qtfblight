@@ -28,6 +28,12 @@ pub const MESSAGE_REQUEST_FULL_REFRESH: u8 = 6;
 pub const UPDATE_ALL: i32 = 0;
 pub const UPDATE_PARTIAL: i32 = 1;
 
+pub const REFRESH_MODE_ULTRA_FAST: i32 = 0;
+pub const REFRESH_MODE_FAST: i32 = 1;
+pub const REFRESH_MODE_ANIMATE: i32 = 2;
+pub const REFRESH_MODE_CONTENT: i32 = 3;
+pub const REFRESH_MODE_UI: i32 = 4;
+
 pub const FBFMT_RM2FB: u8 = 0;
 pub const FBFMT_RMPP_RGB888: u8 = 1;
 pub const FBFMT_RMPP_RGBA8888: u8 = 2;

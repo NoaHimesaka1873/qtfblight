@@ -168,7 +168,7 @@ impl DeviceProfile {
         (
             x.max(0).min(fb_w - 1),
             y.max(0).min(fb_h - 1),
-            d.max(0).min(100),
+            d.clamp(0, 100),
         )
     }
 }
