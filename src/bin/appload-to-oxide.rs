@@ -5,8 +5,8 @@
  */
 
 //! Convert an AppLoad `external.manifest.json` into an Oxide application
-//! registration. QTFB applications are hosted through qtfblight; other
-//! external applications use Oxide's standard runner.
+//! registration hosting the QTFB application through qtfblight. Non-QTFB
+//! manifests are skipped.
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 const DEFAULT_QTFBLIGHT: &str = "/home/root/.vellum/bin/qtfblight";
-const DEFAULT_OXIDE_RUNNER: &str = "/home/root/.vellum/share/oxide/libexec/runner";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +41,6 @@ struct Options {
     input: PathBuf,
     output: Option<PathBuf>,
     qtfblight: PathBuf,
-    oxide_runner: PathBuf,
 }
 
 fn usage() -> &'static str {
@@ -53,8 +51,6 @@ Convert an AppLoad external manifest to an Oxide .oxide registration.\n\
 Options:\n\
   -o, --output <PATH>       Write JSON to PATH instead of stdout\n\
       --qtfblight <PATH>    qtfblight binary (default: /home/root/.vellum/bin/qtfblight)\n\
-      --oxide-runner <PATH> Oxide runner for non-QTFB apps\n\
-                             (default: /home/root/.vellum/share/oxide/libexec/runner)\n\
   -h, --help                Show this help"
 }
 
@@ -63,7 +59,6 @@ fn parse_args() -> Result<Options, String> {
     let mut input = None;
     let mut output = None;
     let mut qtfblight = PathBuf::from(DEFAULT_QTFBLIGHT);
-    let mut oxide_runner = PathBuf::from(DEFAULT_OXIDE_RUNNER);
 
     while let Some(argument) = args.next() {
         match argument.to_string_lossy().as_ref() {
@@ -82,12 +77,6 @@ fn parse_args() -> Result<Options, String> {
                         .ok_or_else(|| "--qtfblight requires a path".to_string())?,
                 );
             }
-            "--oxide-runner" => {
-                oxide_runner = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "--oxide-runner requires a path".to_string())?,
-                );
-            }
             value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
             _ if input.is_some() => {
                 return Err("only one app directory or manifest may be provided".to_string());
@@ -102,7 +91,6 @@ fn parse_args() -> Result<Options, String> {
         })?,
         output,
         qtfblight,
-        oxide_runner,
     })
 }
 
@@ -123,13 +111,6 @@ fn shell_command(application: &Path, args: &[String]) -> String {
     std::iter::once(application.to_string_lossy().into_owned())
         .chain(args.iter().cloned())
         .map(|argument| shell_quote(&argument))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_arguments(args: &[String]) -> String {
-    args.iter()
-        .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -164,17 +145,14 @@ fn skip_reason(manifest: &ExternalManifest) -> Option<&'static str> {
         Some("KOReader is supplied with native Blight support; no registration was generated")
     } else if uses_qtfb_shim(manifest) {
         Some("Oxide imports AppLoad QTFB-shim applications itself; no registration was generated")
+    } else if !manifest.qtfb {
+        Some("application does not use QTFB; no registration was generated")
     } else {
         None
     }
 }
 
-fn translate(
-    manifest: ExternalManifest,
-    app_dir: &Path,
-    qtfblight: &Path,
-    oxide_runner: &Path,
-) -> Value {
+fn translate(manifest: ExternalManifest, app_dir: &Path, qtfblight: &Path) -> Value {
     let application = resolve_path(app_dir, &manifest.application);
     let working_directory = manifest
         .working_directory
@@ -182,29 +160,16 @@ fn translate(
         .map(|directory| resolve_path(app_dir, directory))
         .unwrap_or_else(|| app_dir.to_path_buf());
     let mut environment = manifest.environment;
-
-    let bin = if manifest.qtfb {
-        environment.insert(
-            "_QTFBLIGHT_COMMAND".to_string(),
-            shell_command(&application, &manifest.args),
-        );
-        qtfblight
-    } else {
-        environment.insert(
-            "EXECUTABLE".to_string(),
-            application.to_string_lossy().into_owned(),
-        );
-        if !manifest.args.is_empty() {
-            environment.insert("ARGUMENTS".to_string(), shell_arguments(&manifest.args));
-        }
-        oxide_runner
-    };
+    environment.insert(
+        "_QTFBLIGHT_COMMAND".to_string(),
+        shell_command(&application, &manifest.args),
+    );
 
     let mut registration = Map::new();
     registration.insert("displayName".to_string(), Value::String(manifest.name));
     registration.insert(
         "bin".to_string(),
-        Value::String(bin.to_string_lossy().into_owned()),
+        Value::String(qtfblight.to_string_lossy().into_owned()),
     );
     registration.insert("type".to_string(), Value::String("foreground".to_string()));
     registration.insert("flags".to_string(), json!(["nopreload"]));
@@ -268,7 +233,7 @@ fn run() -> Result<(), String> {
         .parent()
         .ok_or_else(|| "manifest has no parent directory".to_string())?;
     warn_untranslated(&manifest);
-    let registration = translate(manifest, app_dir, &options.qtfblight, &options.oxide_runner);
+    let registration = translate(manifest, app_dir, &options.qtfblight);
     let output = serde_json::to_string_pretty(&registration)
         .map_err(|error| format!("failed to serialize Oxide registration: {error}"))?;
 
@@ -311,7 +276,6 @@ mod tests {
             manifest(true),
             Path::new("/apps/example"),
             Path::new("/opt/qtfblight"),
-            Path::new("/opt/runner"),
         );
 
         assert_eq!(registration["bin"], "/opt/qtfblight");
@@ -327,22 +291,10 @@ mod tests {
     }
 
     #[test]
-    fn non_qtfb_manifest_uses_oxide_runner() {
-        let registration = translate(
-            manifest(false),
-            Path::new("/apps/example"),
-            Path::new("/opt/qtfblight"),
-            Path::new("/opt/runner"),
-        );
-
-        assert_eq!(registration["bin"], "/opt/runner");
+    fn non_qtfb_manifest_is_skipped() {
         assert_eq!(
-            registration["environment"]["EXECUTABLE"],
-            "/apps/example/bin/example"
-        );
-        assert_eq!(
-            registration["environment"]["ARGUMENTS"],
-            "'--message' 'it'\"'\"'s working'"
+            skip_reason(&manifest(false)),
+            Some("application does not use QTFB; no registration was generated")
         );
     }
 

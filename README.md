@@ -30,8 +30,8 @@ appload-to-oxide /home/root/xovi/exthome/appload/example-client \
   --output /home/root/.local/share/applications/example-client.oxide
 ```
 
-`"qtfb": true` uses `/home/root/.vellum/bin/qtfblight`. Shim manifests and KOReader are
-skipped. `icon` is included only when `icon.png` exists.
+`"qtfb": true` uses `/home/root/.vellum/bin/qtfblight`. Non-QTFB manifests, shim
+manifests, and KOReader are skipped. `icon` is included only when `icon.png` exists.
 
 ## Chroot clients
 
