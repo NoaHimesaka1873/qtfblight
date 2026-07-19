@@ -86,6 +86,17 @@ impl ShmSegment {
             return Err(format!("ftruncate failed: {}", err));
         }
 
+        // shm_open's 0o666 is masked by the process umask (root's is usually
+        // 022), which would leave unprivileged clients unable to map the
+        // framebuffer read-write; force the intended mode. Clients write
+        // pixels into this segment, so read-only access is not enough.
+        if unsafe { libc::fchmod(fd, 0o666) } < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            unsafe { libc::shm_unlink(c_name.as_ptr()) };
+            return Err(format!("fchmod failed: {}", err));
+        }
+
         let ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),

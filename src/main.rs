@@ -126,6 +126,23 @@ fn main() {
         }
     };
 
+    // The qtfb protocol has no authentication and the tablet is single-user;
+    // let unprivileged clients (e.g. sway running as a normal user inside a
+    // chroot) connect. bind() masks the socket mode with umask, so under
+    // root's usual 022 the socket would otherwise be root-connect-only.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(0o666),
+        ) {
+            eprintln!(
+                "[main] Warning: failed to set permissions on {}: {}",
+                socket_path, e
+            );
+        }
+    }
+
     // Generate the shared memory key
     let key = server::generate_random_key();
 
