@@ -18,8 +18,8 @@
  */
 
 use crate::blight::{
-    BlightBufferSpec, BlightBus, BlightImageFormat, BlightRepaintRequest, BlightUpdateMode,
-    BlightWaveformMode, LibBlight,
+    BlightBufferSpec, BlightBus, BlightContentType, BlightImageFormat, BlightRepaintRequest,
+    BlightUpdateMode, BlightWaveformMode, LibBlight,
 };
 use crate::device::DeviceProfile;
 use crate::qtfb::{
@@ -328,6 +328,27 @@ fn scale_region(region: Region, source: Dimensions, target: Dimensions) -> Regio
     let x1 = ((x + w) as u64 * target.width as u64).div_ceil(source.width as u64);
     let y1 = ((y + h) as u64 * target.height as u64).div_ceil(source.height as u64);
     (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+/// Blight translation of QTFB's contentless full-refresh request: flash the
+/// screen, ending on the content already in the surface buffer. The flash
+/// comes from `FullUpdate`; the waveform must stay an image-writing one
+/// (`UI`, Oxide's own choice for flashing repaints) — waveform `Full` is the
+/// panel's INIT/clear pass, which drives the screen to white instead of
+/// redrawing the content. Content type is `Color` on every device, not the
+/// profile's: it classifies the content, and Oxide's own ghost-clearing
+/// repaints hardcode `UI` + `Color` + `FullUpdate` on mono panels too.
+fn full_refresh_request(surface_id: u16, profile: &DeviceProfile) -> BlightRepaintRequest {
+    BlightRepaintRequest {
+        surface_id,
+        x: 0,
+        y: 0,
+        width: profile.width,
+        height: profile.height,
+        waveform: BlightWaveformMode::UI,
+        content_type: BlightContentType::Color,
+        update_mode: BlightUpdateMode::FullUpdate,
+    }
 }
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -829,6 +850,20 @@ pub unsafe fn handle_client(
             }
         };
 
+        // Match the white first frame the client SHM starts with, so a
+        // full-screen repaint never composites uninitialized buffer memory
+        // (0xFF is white in both RGB16 and RGBA8888).
+        unsafe {
+            let blight_buf = &*blight_buf_ptr;
+            if !blight_buf.data.is_null() {
+                std::ptr::write_bytes(
+                    blight_buf.data,
+                    0xFF,
+                    blight_buf.stride as usize * blight_buf.height as usize,
+                );
+            }
+        }
+
         let surface_id = match unsafe { libblight.add_surface(bus, blight_buf_ptr) } {
             Ok(id) => id,
             Err(e) => {
@@ -923,16 +958,7 @@ pub unsafe fn handle_client(
                             if active_touches == 5 && !five_finger_refresh_sent {
                                 if let Err(e) = touch_lib.surface_repaint(
                                     touch_blight_fd,
-                                    BlightRepaintRequest {
-                                        surface_id: touch_surface_id,
-                                        x: 0,
-                                        y: 0,
-                                        width: touch_profile.width,
-                                        height: touch_profile.height,
-                                        waveform: BlightWaveformMode::Full,
-                                        content_type: touch_profile.color_type,
-                                        update_mode: BlightUpdateMode::FullUpdate,
-                                    },
+                                    full_refresh_request(touch_surface_id, &touch_profile),
                                 ) {
                                     println!(
                                         "[touch_thread] five-finger full refresh failed: {}",
@@ -1339,19 +1365,9 @@ pub unsafe fn handle_client(
             }
             MESSAGE_REQUEST_FULL_REFRESH => {
                 println!("[server] MESSAGE_REQUEST_FULL_REFRESH received");
-                // Trigger full refresh
                 let repaint_res = libblight.surface_repaint(
                     blight_fd,
-                    BlightRepaintRequest {
-                        surface_id: backend_info.surface_id,
-                        x: 0,
-                        y: 0,
-                        width: profile.width,
-                        height: profile.height,
-                        waveform: BlightWaveformMode::Full,
-                        content_type: profile.color_type,
-                        update_mode: BlightUpdateMode::FullUpdate,
-                    },
+                    full_refresh_request(backend_info.surface_id, &profile),
                 );
                 if let Err(e) = repaint_res {
                     println!("[server] blight_surface_repaint full failed: {}", e);
@@ -1378,6 +1394,33 @@ pub unsafe fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::DeviceType;
+
+    #[test]
+    fn full_refresh_flashes_existing_content_instead_of_blanking() {
+        for device_type in [
+            DeviceType::RM1,
+            DeviceType::RM2,
+            DeviceType::RMPP,
+            DeviceType::RMPPM,
+            DeviceType::RMPure,
+        ] {
+            let profile = DeviceProfile::new(device_type);
+            let request = full_refresh_request(7, &profile);
+            assert_eq!(request.surface_id, 7);
+            assert_eq!(
+                (request.x, request.y, request.width, request.height),
+                (0, 0, profile.width, profile.height)
+            );
+            // Waveform `Full` is the panel's INIT/clear pass and blanks the
+            // screen; the flash must come from FullUpdate + an image-writing
+            // waveform. Content type is Color on mono panels too, matching
+            // Oxide's own ghost-clearing repaints.
+            assert_eq!(request.waveform, BlightWaveformMode::UI);
+            assert_eq!(request.update_mode, BlightUpdateMode::FullUpdate);
+            assert_eq!(request.content_type, BlightContentType::Color);
+        }
+    }
 
     #[test]
     fn qtfb_framebuffer_formats_have_the_reference_byte_sizes() {

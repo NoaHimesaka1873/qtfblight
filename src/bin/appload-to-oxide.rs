@@ -52,7 +52,7 @@ Convert an AppLoad external manifest to an Oxide .oxide registration.\n\
 \n\
 Options:\n\
   -o, --output <PATH>       Write JSON to PATH instead of stdout\n\
-      --qtfblight <PATH>    qtfblight binary (default: /home/root/qtfblight)\n\
+      --qtfblight <PATH>    qtfblight binary (default: /home/root/.vellum/bin/qtfblight)\n\
       --oxide-runner <PATH> Oxide runner for non-QTFB apps\n\
                              (default: /home/root/.vellum/share/oxide/libexec/runner)\n\
   -h, --help                Show this help"
