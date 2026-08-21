@@ -18,6 +18,7 @@
  */
 
 use crate::blight::{BlightContentType, BlightImageFormat};
+use std::ffi::CString;
 use std::fs;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -199,6 +200,127 @@ pub fn detect_device_type() -> DeviceType {
     DeviceType::RM1
 }
 
+const EV_KEY: u16 = 0x01;
+const EV_ABS: u16 = 0x03;
+const KEY_POWER: u16 = 116;
+const BTN_STYLUS: u16 = 0x14b;
+const ABS_MT_SLOT: u16 = 0x2f;
+
+/// EVIOCGVERSION: _IOR('E', 0x01, int)
+const EVIOCGVERSION: libc::c_ulong = (2 << 30) | (4 << 16) | ((b'E' as libc::c_ulong) << 8) | 0x01;
+
+/// EVIOCGBIT(ev, len): _IOC(_IOC_READ, 'E', 0x20 + ev, len)
+fn eviocgbit(ev_type: u16, len: usize) -> libc::c_ulong {
+    (2 << 30)
+        | ((len as libc::c_ulong) << 16)
+        | ((b'E' as libc::c_ulong) << 8)
+        | (0x20 + ev_type as libc::c_ulong)
+}
+
+fn test_bit(bit: u16, bits: &[u8]) -> bool {
+    let byte = (bit / 8) as usize;
+    byte < bits.len() && (bits[byte] >> (bit % 8)) & 1 != 0
+}
+
+fn event_bits(fd: libc::c_int, ev_type: u16) -> [u8; 96] {
+    // 96 bytes covers KEY_MAX (0x2ff), the largest code space queried here.
+    let mut bits = [0u8; 96];
+    unsafe { libc::ioctl(fd, eviocgbit(ev_type, bits.len()), bits.as_mut_ptr()) };
+    bits
+}
+
+fn parse_event_number(name: &str) -> Option<u16> {
+    name.strip_prefix("event")?.parse().ok()
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct ProbedInputDevices {
+    pub touch: Option<u16>,
+    pub pen: Option<u16>,
+    pub button: Option<u16>,
+}
+
+/// Classifies `/dev/input/event*` nodes with the same capability checks (and
+/// the same first-match-wins order) as Oxide's `DeviceSettings`, which is what
+/// decides the device numbers the blight display server publishes input
+/// under. Static per-model numbers break whenever a unit enumerates its input
+/// devices differently, so agreement with the display server has to come from
+/// probing, not from a table.
+pub fn probe_input_devices() -> ProbedInputDevices {
+    let mut probed = ProbedInputDevices::default();
+
+    let Ok(dir) = fs::read_dir("/dev/input") else {
+        return probed;
+    };
+    let mut numbers: Vec<u16> = dir
+        .flatten()
+        .filter_map(|entry| parse_event_number(&entry.file_name().to_string_lossy()))
+        .collect();
+    numbers.sort_unstable();
+
+    for number in numbers {
+        if probed.touch.is_some() && probed.pen.is_some() && probed.button.is_some() {
+            break;
+        }
+        let Ok(path) = CString::new(format!("/dev/input/event{}", number)) else {
+            continue;
+        };
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue;
+        }
+
+        let mut version: libc::c_int = 0;
+        if unsafe { libc::ioctl(fd, EVIOCGVERSION, &mut version) } != 0 {
+            unsafe { libc::close(fd) };
+            continue;
+        }
+
+        let type_bits = event_bits(fd, 0);
+        let key_bits = event_bits(fd, EV_KEY);
+        let abs_bits = event_bits(fd, EV_ABS);
+        unsafe { libc::close(fd) };
+
+        if test_bit(EV_KEY, &type_bits) {
+            if test_bit(BTN_STYLUS, &key_bits) && test_bit(EV_ABS, &type_bits) {
+                probed.pen.get_or_insert(number);
+                continue;
+            }
+            if test_bit(KEY_POWER, &key_bits) {
+                probed.button.get_or_insert(number);
+                continue;
+            }
+        }
+        if test_bit(ABS_MT_SLOT, &abs_bits) {
+            probed.touch.get_or_insert(number);
+        }
+    }
+
+    probed
+}
+
+impl DeviceProfile {
+    /// Replaces the static per-model input device numbers with the ones found
+    /// on the running system, keeping the static number for any class the
+    /// probe could not identify.
+    pub fn apply_probed_input_devices(&mut self, probed: ProbedInputDevices) {
+        if let Some(touch) = probed.touch {
+            self.touch_device = touch;
+        }
+        if let Some(pen) = probed.pen {
+            self.pen_device = pen;
+        }
+        if let Some(button) = probed.button {
+            self.button_device = button;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +375,35 @@ mod tests {
         assert_eq!(px, 953);
         assert_eq!(py, 1695);
         assert_eq!(pd, 100);
+    }
+
+    #[test]
+    fn event_numbers_parse_from_dev_input_names() {
+        assert_eq!(parse_event_number("event0"), Some(0));
+        assert_eq!(parse_event_number("event12"), Some(12));
+        assert_eq!(parse_event_number("mice"), None);
+        assert_eq!(parse_event_number("eventx"), None);
+    }
+
+    #[test]
+    fn probed_devices_override_only_what_was_found() {
+        let mut profile = DeviceProfile::new(DeviceType::RM1);
+        profile.apply_probed_input_devices(ProbedInputDevices {
+            touch: Some(5),
+            pen: None,
+            button: Some(7),
+        });
+        assert_eq!(profile.touch_device, 5);
+        assert_eq!(profile.pen_device, 0);
+        assert_eq!(profile.button_device, 7);
+    }
+
+    #[test]
+    fn eviocgbit_matches_kernel_encoding() {
+        // _IOC(_IOC_READ, 'E', 0x20 + EV_KEY, 96)
+        assert_eq!(eviocgbit(EV_KEY, 96) & 0xffff_ffff, 0x8060_4521);
+        // EVIOCGVERSION = _IOR('E', 0x01, int)
+        assert_eq!(EVIOCGVERSION & 0xffff_ffff, 0x8004_4501);
     }
 
     #[test]

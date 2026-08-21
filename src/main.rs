@@ -87,10 +87,37 @@ fn main() {
 
     // 3. Device detection
     let dev_type = device::detect_device_type();
-    let profile = device::DeviceProfile::new(dev_type);
+    let mut profile = device::DeviceProfile::new(dev_type);
     println!(
         "[main] Starting qtfblight on {} (format: {:?})",
         profile.name, profile.format
+    );
+
+    // The blight display server publishes input under the event numbers it
+    // found by probing capabilities, not under fixed per-model numbers; match
+    // its selection so input forwarding works on every enumeration.
+    let probed = device::probe_input_devices();
+    profile.apply_probed_input_devices(probed);
+    println!(
+        "[main] Input devices: touch=event{}{} pen=event{}{} buttons=event{}{}",
+        profile.touch_device,
+        if probed.touch.is_some() {
+            ""
+        } else {
+            " (fallback)"
+        },
+        profile.pen_device,
+        if probed.pen.is_some() {
+            ""
+        } else {
+            " (fallback)"
+        },
+        profile.button_device,
+        if probed.button.is_some() {
+            ""
+        } else {
+            " (fallback)"
+        },
     );
 
     // 4. DBus Connection
@@ -132,10 +159,9 @@ fn main() {
     // root's usual 022 the socket would otherwise be root-connect-only.
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(
-            &socket_path,
-            std::fs::Permissions::from_mode(0o666),
-        ) {
+        if let Err(e) =
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+        {
             eprintln!(
                 "[main] Warning: failed to set permissions on {}: {}",
                 socket_path, e
