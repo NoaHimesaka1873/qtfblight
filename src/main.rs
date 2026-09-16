@@ -87,10 +87,25 @@ fn main() {
 
     // 3. Device detection
     let dev_type = device::detect_device_type();
-    let profile = device::DeviceProfile::new(dev_type);
+    let mut profile = device::DeviceProfile::new(dev_type);
     println!(
         "[main] Starting qtfblight on {} (format: {:?})",
         profile.name, profile.format
+    );
+
+    // Event numbers vary by model and firmware; the profile's numbers are
+    // only a fallback for classes the capability probe cannot find.
+    let detected = device::detect_input_devices();
+    profile.apply_detected_input_devices(detected);
+    let origin = |found: Option<u16>| if found.is_some() { "" } else { " (fallback)" };
+    println!(
+        "[main] Input devices: touch=event{}{} pen=event{}{} buttons=event{}{}",
+        profile.touch_device,
+        origin(detected.touch),
+        profile.pen_device,
+        origin(detected.pen),
+        profile.button_device,
+        origin(detected.button),
     );
 
     // 4. DBus Connection

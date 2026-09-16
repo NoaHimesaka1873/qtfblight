@@ -18,6 +18,7 @@
  */
 
 use crate::blight::{BlightContentType, BlightImageFormat};
+use std::ffi::CString;
 use std::fs;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -52,9 +53,11 @@ impl DeviceProfile {
                 height: 1872,
                 format: BlightImageFormat::FormatRGB16,
                 color_type: BlightContentType::Monochrome,
-                touch_device: 1,
+                // Firmware >= 2.9 layout (buttons and touch swapped nodes
+                // relative to older releases).
+                touch_device: 2,
                 pen_device: 0,
-                button_device: 2,
+                button_device: 1,
             },
             DeviceType::RM2 => DeviceProfile {
                 device_type,
@@ -199,9 +202,285 @@ pub fn detect_device_type() -> DeviceType {
     DeviceType::RM1
 }
 
+const EV_KEY: u16 = 0x01;
+const EV_ABS: u16 = 0x03;
+const KEY_HOME: u16 = 102;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_POWER: u16 = 116;
+const BTN_TOOL_PEN: u16 = 0x140;
+const BTN_STYLUS: u16 = 0x14b;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_POSITION_X: u16 = 0x35;
+
+/// EVIOCGVERSION: _IOR('E', 0x01, int)
+const EVIOCGVERSION: libc::c_ulong = (2 << 30) | (4 << 16) | ((b'E' as libc::c_ulong) << 8) | 0x01;
+
+/// EVIOCGBIT(ev, len): _IOC(_IOC_READ, 'E', 0x20 + ev, len)
+fn eviocgbit(ev_type: u16, len: usize) -> libc::c_ulong {
+    (2 << 30)
+        | ((len as libc::c_ulong) << 16)
+        | ((b'E' as libc::c_ulong) << 8)
+        | (0x20 + ev_type as libc::c_ulong)
+}
+
+/// Enough bytes for KEY_MAX (0x2ff), the largest code space queried.
+const BITS_LEN: usize = 96;
+
+fn test_bit(bit: u16, bits: &[u8]) -> bool {
+    let byte = (bit / 8) as usize;
+    byte < bits.len() && (bits[byte] >> (bit % 8)) & 1 != 0
+}
+
+fn event_bits(fd: libc::c_int, ev_type: u16) -> [u8; BITS_LEN] {
+    let mut bits = [0u8; BITS_LEN];
+    unsafe { libc::ioctl(fd, eviocgbit(ev_type, bits.len()), bits.as_mut_ptr()) };
+    bits
+}
+
+fn parse_event_number(name: &str) -> Option<u16> {
+    name.strip_prefix("event")?.parse().ok()
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum InputClass {
+    Touch,
+    Pen,
+    Buttons,
+}
+
+/// Classifies one evdev node by its strongest capability signature. Each
+/// class is decided on its own evidence so that incidental bits cannot steal
+/// a device: the rM1 touchscreen advertises EV_KEY with no key codes, the
+/// Wacom digitizer advertises BTN_TOUCH, and only the multitouch axes, the
+/// stylus buttons or the hardware keys are unambiguous.
+pub fn classify_input_device(
+    type_bits: &[u8],
+    key_bits: &[u8],
+    abs_bits: &[u8],
+) -> Option<InputClass> {
+    let has_abs = test_bit(EV_ABS, type_bits);
+    let has_key = test_bit(EV_KEY, type_bits);
+
+    if has_abs && (test_bit(ABS_MT_POSITION_X, abs_bits) || test_bit(ABS_MT_SLOT, abs_bits)) {
+        return Some(InputClass::Touch);
+    }
+    if has_abs
+        && has_key
+        && test_bit(ABS_X, abs_bits)
+        && test_bit(ABS_Y, abs_bits)
+        && (test_bit(BTN_TOOL_PEN, key_bits) || test_bit(BTN_STYLUS, key_bits))
+    {
+        return Some(InputClass::Pen);
+    }
+    if has_key
+        && !has_abs
+        && (test_bit(KEY_POWER, key_bits)
+            || test_bit(KEY_LEFT, key_bits)
+            || test_bit(KEY_HOME, key_bits)
+            || test_bit(KEY_RIGHT, key_bits))
+    {
+        return Some(InputClass::Buttons);
+    }
+    None
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct DetectedInputDevices {
+    pub touch: Option<u16>,
+    pub pen: Option<u16>,
+    pub button: Option<u16>,
+}
+
+/// Finds the touch, pen and button event numbers by probing capabilities of
+/// every `/dev/input/event*` node. The blight display server publishes input
+/// under the kernel's event numbers, and those differ between models and
+/// firmware releases (the rM1 swapped touch and buttons in 2.9), so a static
+/// table cannot be trusted. The lowest-numbered match wins per class, which
+/// keeps built-in devices ahead of hot-plugged accessories.
+pub fn detect_input_devices() -> DetectedInputDevices {
+    let mut detected = DetectedInputDevices::default();
+
+    let Ok(dir) = fs::read_dir("/dev/input") else {
+        return detected;
+    };
+    let mut numbers: Vec<u16> = dir
+        .flatten()
+        .filter_map(|entry| parse_event_number(&entry.file_name().to_string_lossy()))
+        .collect();
+    numbers.sort_unstable();
+
+    for number in numbers {
+        let Ok(path) = CString::new(format!("/dev/input/event{}", number)) else {
+            continue;
+        };
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue;
+        }
+
+        let mut version: libc::c_int = 0;
+        if unsafe { libc::ioctl(fd, EVIOCGVERSION, &mut version) } != 0 {
+            unsafe { libc::close(fd) };
+            continue;
+        }
+
+        let type_bits = event_bits(fd, 0);
+        let key_bits = event_bits(fd, EV_KEY);
+        let abs_bits = event_bits(fd, EV_ABS);
+        unsafe { libc::close(fd) };
+
+        match classify_input_device(&type_bits, &key_bits, &abs_bits) {
+            Some(InputClass::Touch) => {
+                detected.touch.get_or_insert(number);
+            }
+            Some(InputClass::Pen) => {
+                detected.pen.get_or_insert(number);
+            }
+            Some(InputClass::Buttons) => {
+                detected.button.get_or_insert(number);
+            }
+            None => {}
+        }
+    }
+
+    detected
+}
+
+impl DeviceProfile {
+    /// Replaces the static per-model event numbers with the detected ones,
+    /// keeping the static number for any class that was not found.
+    pub fn apply_detected_input_devices(&mut self, detected: DetectedInputDevices) {
+        if let Some(touch) = detected.touch {
+            self.touch_device = touch;
+        }
+        if let Some(pen) = detected.pen {
+            self.pen_device = pen;
+        }
+        if let Some(button) = detected.button {
+            self.button_device = button;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bits(codes: &[u16]) -> [u8; BITS_LEN] {
+        let mut bits = [0u8; BITS_LEN];
+        for &code in codes {
+            bits[(code / 8) as usize] |= 1 << (code % 8);
+        }
+        bits
+    }
+
+    // Capability sets below are the evtest dump of a reMarkable 1 on current
+    // firmware: event0 Wacom, event1 gpio-keys, event2 cyttsp5_mt.
+
+    #[test]
+    fn rm1_wacom_digitizer_classifies_as_pen() {
+        let class = classify_input_device(
+            &bits(&[EV_KEY, EV_ABS]),
+            &bits(&[BTN_TOOL_PEN, 0x141, 0x14a, BTN_STYLUS, 0x14c]),
+            &bits(&[ABS_X, ABS_Y, 0x18, 0x19, 0x1a, 0x1b]),
+        );
+        assert_eq!(class, Some(InputClass::Pen));
+    }
+
+    #[test]
+    fn rm1_gpio_keys_classify_as_buttons() {
+        let class = classify_input_device(
+            &bits(&[EV_KEY]),
+            &bits(&[KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_POWER, 143]),
+            &bits(&[]),
+        );
+        assert_eq!(class, Some(InputClass::Buttons));
+    }
+
+    #[test]
+    fn rm1_cyttsp5_mt_classifies_as_touch_despite_empty_ev_key() {
+        // EV_KEY and EV_REL type bits are set with no codes behind them.
+        let class = classify_input_device(
+            &bits(&[EV_KEY, 0x02, EV_ABS]),
+            &bits(&[]),
+            &bits(&[
+                0x19,
+                ABS_MT_SLOT,
+                0x30,
+                0x31,
+                0x34,
+                ABS_MT_POSITION_X,
+                0x36,
+                0x37,
+                0x39,
+                0x3a,
+            ]),
+        );
+        assert_eq!(class, Some(InputClass::Touch));
+    }
+
+    #[test]
+    fn multitouch_axes_outrank_stylus_buttons() {
+        // A panel that also reports stylus buttons and single-touch axes is
+        // still the touchscreen, not a second pen.
+        let class = classify_input_device(
+            &bits(&[EV_KEY, EV_ABS]),
+            &bits(&[BTN_STYLUS, 0x14a]),
+            &bits(&[ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, 0x36]),
+        );
+        assert_eq!(class, Some(InputClass::Touch));
+    }
+
+    #[test]
+    fn switch_only_and_unknown_devices_are_ignored() {
+        // Paper Pro hall sensor: EV_SW only.
+        assert_eq!(
+            classify_input_device(&bits(&[0x05]), &bits(&[]), &bits(&[])),
+            None
+        );
+        // A keyboard without power or navigation keys.
+        assert_eq!(
+            classify_input_device(&bits(&[EV_KEY]), &bits(&[30, 31, 32]), &bits(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn event_numbers_parse_from_dev_input_names() {
+        assert_eq!(parse_event_number("event0"), Some(0));
+        assert_eq!(parse_event_number("event12"), Some(12));
+        assert_eq!(parse_event_number("mice"), None);
+        assert_eq!(parse_event_number("eventx"), None);
+    }
+
+    #[test]
+    fn detected_devices_override_only_what_was_found() {
+        let mut profile = DeviceProfile::new(DeviceType::RM1);
+        profile.apply_detected_input_devices(DetectedInputDevices {
+            touch: Some(5),
+            pen: None,
+            button: Some(7),
+        });
+        assert_eq!(profile.touch_device, 5);
+        assert_eq!(profile.pen_device, 0);
+        assert_eq!(profile.button_device, 7);
+    }
+
+    #[test]
+    fn eviocgbit_matches_kernel_encoding() {
+        // _IOC(_IOC_READ, 'E', 0x20 + EV_KEY, 96)
+        assert_eq!(eviocgbit(EV_KEY, 96) & 0xffff_ffff, 0x8060_4521);
+        // EVIOCGVERSION = _IOR('E', 0x01, int)
+        assert_eq!(EVIOCGVERSION & 0xffff_ffff, 0x8004_4501);
+    }
 
     #[test]
     fn test_rm1_transforms() {
